@@ -1,6 +1,37 @@
 import Foundation
 import StrandAnalytics
 
+/// Build the shared OpenAI-compatible chat-completions body. Modern reasoning models require
+/// `max_completion_tokens` and reject both `max_tokens` and `temperature`.
+func openAICompatibleChatBody(
+    model: String,
+    messages: [[String: Any]],
+    modernParams: Bool,
+    stream: Bool
+) -> [String: Any] {
+    var body: [String: Any] = ["model": model, "messages": messages]
+    if modernParams {
+        body["max_completion_tokens"] = 4096
+    } else {
+        body["temperature"] = 0.6
+        body["max_tokens"] = 4096
+    }
+    if stream {
+        body["stream"] = true
+    }
+    return body
+}
+
+/// Whether an OpenAI-compatible 400 indicates that the request should be retried with the modern
+/// token-limit shape. Kept model-agnostic so newly released reasoning models work without a table.
+func shouldRetryOpenAIModernParams(_ detail: String) -> Bool {
+    let normalized = detail.lowercased()
+    return normalized.contains("max_completion_tokens")
+        || normalized.contains("max_tokens")
+        || normalized.contains("temperature")
+        || normalized.contains("unsupported")
+}
+
 // MARK: - Provider enum
 
 enum AIProvider: String, CaseIterable, Identifiable {
@@ -38,12 +69,16 @@ enum AIProvider: String, CaseIterable, Identifiable {
             // does (#400), so this list is bumped by hand. `refreshModels()` merges the live /models
             // catalogue, which stays the authority for anything released after this.
             //
-            // The reasoning tiers (o3, o4-mini) and the GPT-5 family reject `temperature` and
-            // `max_tokens`. Nothing special is needed for them here: the request path sends the
-            // classic parameters, and on a 400 naming one of them retries with
-            // `max_completion_tokens` and no temperature (see AiCoach's modernParams leg). The cost
-            // is one extra round trip on the first message, not a per-model table to maintain.
+            // The reasoning tiers (o3, o4-mini) and the GPT-5 / GPT-6 families reject `temperature`
+            // and `max_tokens`. Nothing special is needed for them here: both the streamed and the
+            // non-streamed request send the classic parameters, and on a 400 naming one of them
+            // retry with `max_completion_tokens` and no temperature (`shouldRetryOpenAIModernParams`).
+            // The cost is one extra round trip per message, not a per-model table to maintain.
             return [
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6-sol",
+                "gpt-6-luna",
                 "gpt-5",
                 "gpt-5-mini",
                 "gpt-5-nano",

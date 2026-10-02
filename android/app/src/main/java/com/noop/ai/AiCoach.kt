@@ -741,22 +741,17 @@ class AiCoach(
         customAuthHeader: CustomAiAuthHeader,
         modernParams: Boolean,
     ): Pair<Int, String> {
-        val body = JSONObject()
-            .put("model", model)
-            .put("messages", messages)
-        if (modernParams) {
-            // #1074: same 4096 cap as the standard path below. This modern-params leg fronts REASONING
-            // models, which count hidden thinking tokens against max_completion_tokens — so 900 starved
-            // them into truncated/empty replies even more readily. A cap, not a target.
-            body.put("max_completion_tokens", 4096)
-        } else {
-            body.put("temperature", 0.6)
-            // #1074: 900 truncated detailed coaching replies mid-sentence on cloud providers (the reporter
-            // hit it on a DeepSeek "pro" model). 4096 lets a full multi-section reply complete; it is a cap,
-            // not a target, so short answers are unaffected. Matches the Gemini leg's maxOutputTokens.
-            body.put("max_tokens", 4096)
-        }
+        val body = openAiCompatibleChatBody(model, messages, modernParams, stream = false)
+        return execute(openAiCompatibleRequest(provider, url, key, customAuthHeader, body))
+    }
 
+    private fun openAiCompatibleRequest(
+        provider: AiProvider,
+        url: String,
+        key: String?,
+        customAuthHeader: CustomAiAuthHeader,
+        body: JSONObject,
+    ): Request {
         val builder = Request.Builder()
             .url(url)
             .addHeader("Content-Type", "application/json")
@@ -765,7 +760,7 @@ class AiCoach(
             AiProvider.CUSTOM -> applyCustomAuthHeader(builder, key, customAuthHeader)
             else -> if (!key.isNullOrBlank()) builder.addHeader("Authorization", "Bearer $key")
         }
-        return execute(builder.build())
+        return builder.build()
     }
 
     private fun applyCustomAuthHeader(
@@ -778,14 +773,6 @@ class AiCoach(
             CustomAiAuthHeader.BEARER -> builder.addHeader("Authorization", "Bearer $key")
             CustomAiAuthHeader.X_API_KEY -> builder.addHeader("x-api-key", key)
         }
-    }
-
-    private fun shouldRetryOpenAiModernParams(text: String): Boolean {
-        val detail = runCatching { parse(text).toString() }.getOrDefault(text).lowercase()
-        return detail.contains("max_completion_tokens") ||
-            detail.contains("max_tokens") ||
-            detail.contains("temperature") ||
-            detail.contains("unsupported")
     }
 
     /** Base for the Custom provider, the user's URL with any trailing slashes trimmed. */
@@ -937,8 +924,10 @@ class AiCoach(
     // K1: Streaming provider calls (SSE via OkHttp BufferedSource)
     // ---------------------------------------------------------------------------------------
 
-    /** Stream an OpenAI-compatible chat (OpenAI + Custom). Same body as [callOpenAiCompatible]'s
-     *  standard-params path, with `stream: true`. SSE parsed via [SseDeltas.openAiDelta]. */
+    /** Stream an OpenAI-compatible chat (OpenAI + Custom). Same body as [callOpenAiCompatible], with
+     *  `stream: true`, and the same modern-params retry on a 400 (GPT-5 and later reject `max_tokens`).
+     *  A 400 arrives before any SSE line, so no delta has been emitted when the retry starts. SSE
+     *  parsed via [SseDeltas.openAiDelta]. */
     private fun callOpenAiCompatibleStream(
         provider: AiProvider,
         url: String,
@@ -953,21 +942,18 @@ class AiCoach(
         messages.put(JSONObject().put("role", "system").put("content", systemPrompt))
         for (m in history) messages.put(JSONObject().put("role", m.role).put("content", m.text))
 
-        val body = JSONObject()
-            .put("model", model)
-            .put("messages", messages)
-            .put("temperature", 0.6)
-            .put("max_tokens", 4096)
-            .put("stream", true)
-            .toString()
-
-        val builder = Request.Builder().url(url).addHeader("Content-Type", "application/json")
-            .post(body.toRequestBody(JSON))
-        when (provider) {
-            AiProvider.CUSTOM -> applyCustomAuthHeader(builder, key, customAuthHeader)
-            else -> if (!key.isNullOrBlank()) builder.addHeader("Authorization", "Bearer $key")
+        fun attempt(modernParams: Boolean): Pair<Int, String>? {
+            val body = openAiCompatibleChatBody(model, messages, modernParams, stream = true)
+            val request = openAiCompatibleRequest(provider, url, key, customAuthHeader, body)
+            return streamOrFailure(request, onDelta) { payload -> SseDeltas.openAiDelta(payload) }
         }
-        executeStreaming(builder.build(), provider, onDelta) { payload -> SseDeltas.openAiDelta(payload) }
+
+        val (code, text) = attempt(modernParams = false) ?: return
+        if (code == 400 && shouldRetryOpenAiModernParams(text)) {
+            val (retryCode, retryText) = attempt(modernParams = true) ?: return
+            throw httpError(provider, retryCode, retryText)
+        }
+        throw httpError(provider, code, text)
     }
 
     /** Stream an Anthropic chat. Same body as [callAnthropic], with `stream: true`. SSE parsed
@@ -1045,11 +1031,22 @@ class AiCoach(
         onDelta: (String) -> Unit,
         extractDelta: (String) -> String?,
     ) {
+        val (code, body) = streamOrFailure(request, onDelta, extractDelta) ?: return
+        throw httpError(provider, code, body)
+    }
+
+    /** Run a streaming SSE request. Returns null once the stream completes, or the status code and
+     *  error body of a non-2xx response so the caller can decide whether to retry. Network failures
+     *  are mapped to friendly messages, as in [execute]. */
+    private fun streamOrFailure(
+        request: Request,
+        onDelta: (String) -> Unit,
+        extractDelta: (String) -> String?,
+    ): Pair<Int, String>? {
         try {
             http.newCall(request).execute().use { resp ->
                 if (resp.code !in 200..299) {
-                    val body = resp.body?.string().orEmpty()
-                    throw httpError(provider, resp.code, body)
+                    return resp.code to resp.body?.string().orEmpty()
                 }
                 val source = resp.body?.source()
                     ?: throw Exception("The provider returned an empty streaming response.")
@@ -1059,6 +1056,7 @@ class AiCoach(
                     val delta = extractDelta(payload) ?: continue
                     onDelta(delta)
                 }
+                return null
             }
         } catch (e: java.net.UnknownHostException) {
             throw Exception("No internet connection. The coach needs a connection to reach the provider.")
@@ -1241,6 +1239,45 @@ class AiCoach(
                 "The provider returned an empty reply. If you set a custom model by hand, check that " +
                     "the model name is one the provider actually offers."
             }
+        }
+
+        /**
+         * The OpenAI-compatible chat-completions body. The classic shape sends `temperature` +
+         * `max_tokens`; [modernParams] sends `max_completion_tokens` only, which reasoning models
+         * (o-series, GPT-5 and later) require, rejecting the other two. Both cap at 4096 (#1074: 900
+         * truncated detailed replies; reasoning models count hidden thinking tokens against the cap).
+         * Twin of Swift `openAICompatibleChatBody`.
+         */
+        internal fun openAiCompatibleChatBody(
+            model: String,
+            messages: JSONArray,
+            modernParams: Boolean,
+            stream: Boolean,
+        ): JSONObject {
+            val body = JSONObject()
+                .put("model", model)
+                .put("messages", messages)
+            if (modernParams) {
+                body.put("max_completion_tokens", 4096)
+            } else {
+                body.put("temperature", 0.6)
+                body.put("max_tokens", 4096)
+            }
+            if (stream) body.put("stream", true)
+            return body
+        }
+
+        /**
+         * Whether a 400 from an OpenAI-compatible endpoint means "retry with the modern token-limit
+         * shape". Model-agnostic, so a newly released reasoning model works without a table.
+         * Twin of Swift `shouldRetryOpenAIModernParams`.
+         */
+        internal fun shouldRetryOpenAiModernParams(text: String): Boolean {
+            val detail = text.lowercase()
+            return detail.contains("max_completion_tokens") ||
+                detail.contains("max_tokens") ||
+                detail.contains("temperature") ||
+                detail.contains("unsupported")
         }
 
         /**

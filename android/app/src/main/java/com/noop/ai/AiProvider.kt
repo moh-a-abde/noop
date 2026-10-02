@@ -29,12 +29,16 @@ enum class AiProvider(
         // (#400), so this list is bumped by hand. The live /models refresh stays the authority for
         // anything released after this.
         //
-        // The reasoning tiers (o3, o4-mini) and the GPT-5 family reject `temperature` and
+        // The reasoning tiers (o3, o4-mini) and the GPT-5 / GPT-6 families reject `temperature` and
         // `max_tokens`. Nothing special is needed for them here: [AiCoach] sends the classic
-        // parameters and, on a 400 naming one of them, retries with `max_completion_tokens` and no
-        // temperature. One extra round trip on the first message, not a per-model table to maintain.
-        // Twin of the Swift `AIProvider.modelOptions`.
+        // parameters on both the streamed and non-streamed paths and, on a 400 naming one of them,
+        // retries with `max_completion_tokens` and no temperature. One extra round trip per message,
+        // not a per-model table to maintain. Twin of the Swift `AIProvider.modelOptions`.
         models = listOf(
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5",
             "gpt-5-mini",
             "gpt-5-nano",

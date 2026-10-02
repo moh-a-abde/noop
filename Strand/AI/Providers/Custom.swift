@@ -22,19 +22,14 @@ struct CustomClient: AIProviderClient {
         // reject `temperature`/`max_tokens` and want `max_completion_tokens`; retry on that 400.
         do {
             return try await chat(key: key, model: model, wire: wire, modernParams: false, session: session)
-        } catch let AICoachError.server(code, detail) where code == 400 {
-            let d = detail.lowercased()
-            if d.contains("max_completion_tokens") || d.contains("max_tokens")
-                || d.contains("temperature") || d.contains("unsupported") {
-                return try await chat(key: key, model: model, wire: wire, modernParams: true, session: session)
-            }
-            throw AICoachError.server(code, detail)
+        } catch let AICoachError.server(code, detail) where code == 400 && shouldRetryOpenAIModernParams(detail) {
+            return try await chat(key: key, model: model, wire: wire, modernParams: true, session: session)
         }
     }
 
     /// K1: Stream via `stream: true` (most local OpenAI-compatible servers support it). Same body
-    /// as `send`'s standard-params path, with `stream: true`. SSE parsing via `SseDeltas.openAiDelta`.
-    /// The modern-params retry on 400 is NOT streamed (rare path; falls back to `send`'s retry).
+    /// as `send`, with `stream: true`, and the same modern-params retry on a 400. SSE parsing via
+    /// `SseDeltas.openAiDelta`.
     func stream(
         key: String,
         model: String,
@@ -47,24 +42,12 @@ struct CustomClient: AIProviderClient {
         var wire: [[String: Any]] = [["role": "system", "content": systemPrompt]]
         for m in messages { wire.append(["role": m.role.rawValue, "content": m.content]) }
 
-        let body: [String: Any] = [
-            "model": model,
-            "messages": wire,
-            "temperature": 0.6,
-            "max_tokens": 4096,
-            "stream": true
-        ]
-
-        var req = URLRequest(url: AIProvider.custom.endpoint)
-        req.httpMethod = "POST"
-        AIProvider.applyCustomAuthHeader(key, to: &req)
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        try await performStreamingRequest(req, session: session) { payload in
-            if let delta = SseDeltas.openAiDelta(payload) {
-                onDelta(delta)
-            }
+        do {
+            try await streamChat(key: key, model: model, wire: wire, modernParams: false,
+                                 session: session, onDelta: onDelta)
+        } catch let AICoachError.server(code, detail) where code == 400 && shouldRetryOpenAIModernParams(detail) {
+            try await streamChat(key: key, model: model, wire: wire, modernParams: true,
+                                 session: session, onDelta: onDelta)
         }
     }
 
@@ -129,8 +112,34 @@ struct CustomClient: AIProviderClient {
 
     // MARK: Private
 
+    /// The auth header is omitted when `key` is empty (local servers).
+    private func request(key: String, body: [String: Any]) throws -> URLRequest {
+        var req = URLRequest(url: AIProvider.custom.endpoint)
+        req.httpMethod = "POST"
+        AIProvider.applyCustomAuthHeader(key, to: &req)
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return req
+    }
+
+    private func streamChat(
+        key: String,
+        model: String,
+        wire: [[String: Any]],
+        modernParams: Bool,
+        session: URLSession,
+        onDelta: (String) -> Void
+    ) async throws {
+        let body = openAICompatibleChatBody(model: model, messages: wire, modernParams: modernParams, stream: true)
+        try await performStreamingRequest(try request(key: key, body: body), session: session) { payload in
+            if let delta = SseDeltas.openAiDelta(payload) {
+                onDelta(delta)
+            }
+        }
+    }
+
     /// `modernParams`: use `max_completion_tokens`, drop `temperature` — for gateways fronting
-    /// reasoning models. The auth header is omitted when `key` is empty (local servers).
+    /// reasoning models.
     private func chat(
         key: String,
         model: String,
@@ -138,23 +147,10 @@ struct CustomClient: AIProviderClient {
         modernParams: Bool,
         session: URLSession
     ) async throws -> String {
-        var body: [String: Any] = ["model": model, "messages": wire]
         // #1074: 900 truncated detailed coaching replies mid-sentence on cloud providers; 4096 lets a
         // full multi-section reply complete (a cap, not a target). Matches the Gemini leg + Android.
-        if modernParams {
-            body["max_completion_tokens"] = 4096
-        } else {
-            body["temperature"] = 0.6
-            body["max_tokens"] = 4096
-        }
-
-        var req = URLRequest(url: AIProvider.custom.endpoint)
-        req.httpMethod = "POST"
-        AIProvider.applyCustomAuthHeader(key, to: &req)
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let json = try await performRequest(req, session: session)
+        let body = openAICompatibleChatBody(model: model, messages: wire, modernParams: modernParams, stream: false)
+        let json = try await performRequest(try request(key: key, body: body), session: session)
         return try parseChatContent(json)
     }
 }
